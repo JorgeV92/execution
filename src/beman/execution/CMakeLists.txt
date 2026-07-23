@@ -244,7 +244,9 @@ target_sources(
 if(BEMAN_USE_MODULES)
     target_sources(
         ${BEMAN_EXECUTION_TARGET_PREFIX}
-        PRIVATE execution.cpp # TODO(CK): check if really needed!
+        PRIVATE
+            execution.cpp # TODO(CK): check if really needed!
+            parallel_scheduler_default.cpp
         PUBLIC
             FILE_SET CXX_MODULES
                 FILES

@@ -1,24 +1,24 @@
-// src/beman/execution/tests/exec-parallel-scheduler.test.cpp       -*-C++-*-
+// tests/beman/execution/exec-parallel-scheduler.test.cpp            -*-C++-*-
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include <numeric>
+#include <algorithm>
 #include <atomic>
-#include <concepts>
+#include <barrier>
 #include <condition_variable>
+#include <concepts>
 #include <cstddef>
 #include <exception>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <queue>
 #include <span>
-#include <stdexcept>
-#include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
 #include <test/execution.hpp>
+
 #ifdef BEMAN_HAS_MODULES
 import beman.execution;
 import beman.execution.detail.schedule_result_t;
@@ -26,254 +26,197 @@ import beman.execution.detail.schedule_result_t;
 #include <beman/execution.hpp>
 #endif
 
+namespace beman::execution::detail {
+auto makePortableParallelSchedulerBackendForTesting(::std::size_t)
+    -> ::std::shared_ptr<::beman::execution::parallel_scheduler_replacement::parallel_scheduler_backend>;
+auto failNextParallelSchedulerAllocationForTesting() noexcept -> void;
+auto failNextParallelSchedulerEnqueueForTesting() noexcept -> void;
+auto resetParallelSchedulerAllocationCountsForTesting() noexcept -> void;
+auto parallelSchedulerInPlaceAllocationsForTesting() noexcept -> ::std::size_t;
+auto parallelSchedulerHeapAllocationsForTesting() noexcept -> ::std::size_t;
+} // namespace beman::execution::detail
+
 namespace {
-namespace replaceability = test_std::parallel_scheduler_replacement;
+namespace replacement = test_std::parallel_scheduler_replacement;
 
-struct proxy : replaceability::receiver_proxy {
-    auto set_value() noexcept -> void override {}
-    auto set_error(::std::exception_ptr) noexcept -> void override {}
-    auto set_stopped() noexcept -> void override {}
+enum class completion_kind { value, error, stopped };
+
+struct completion_state {
+    auto complete(completion_kind kind, const ::std::exception_ptr& error = {}) noexcept -> void {
+        {
+            const ::std::lock_guard guard(m_mutex);
+            ++m_count;
+            m_kind  = kind;
+            m_error = error;
+        }
+        m_condition.notify_all();
+    }
+
+    auto wait() -> void {
+        ::std::unique_lock guard(m_mutex);
+        m_condition.wait(guard, [this] { return m_count != 0uz; });
+    }
+
+    auto count() const -> ::std::size_t {
+        const ::std::lock_guard guard(m_mutex);
+        return m_count;
+    }
+
+    auto kind() const -> completion_kind {
+        const ::std::lock_guard guard(m_mutex);
+        return m_kind;
+    }
+
+    auto hasError() const -> bool {
+        const ::std::lock_guard guard(m_mutex);
+        return static_cast<bool>(m_error);
+    }
+
+  private:
+    mutable ::std::mutex      m_mutex;
+    ::std::condition_variable m_condition;
+    ::std::size_t             m_count{};
+    completion_kind           m_kind{completion_kind::value};
+    ::std::exception_ptr      m_error;
 };
 
-struct bulk_proxy : replaceability::bulk_item_receiver_proxy {
-    auto set_value() noexcept -> void override {}
-    auto set_error(::std::exception_ptr) noexcept -> void override {}
-    auto set_stopped() noexcept -> void override {}
-    auto execute(::std::size_t, ::std::size_t) noexcept -> void override {}
+struct proxy : replacement::receiver_proxy {
+    explicit proxy(completion_state&                             completion,
+                   ::std::optional<test_std::inplace_stop_token> token = ::std::nullopt) noexcept
+        : m_completion(&completion), m_token(token) {}
+
+    auto set_value() noexcept -> void override { m_completion->complete(completion_kind::value); }
+
+    auto set_error(::std::exception_ptr error) noexcept -> void override {
+        m_completion->complete(completion_kind::error, error);
+    }
+
+    auto set_stopped() noexcept -> void override { m_completion->complete(completion_kind::stopped); }
+
+  private:
+    auto query_stop_token() const noexcept -> ::std::optional<test_std::inplace_stop_token> override {
+        return m_token;
+    }
+
+    completion_state*                             m_completion;
+    ::std::optional<test_std::inplace_stop_token> m_token;
 };
 
-struct backend : replaceability::parallel_scheduler_backend {
-    auto schedule(replaceability::receiver_proxy&, ::std::span<::std::byte>) noexcept -> void override {}
+struct bulk_proxy : replacement::bulk_item_receiver_proxy {
+    bulk_proxy(::std::size_t                                 shape,
+               completion_state&                             completion,
+               bool                                          expectUnchunked = false,
+               ::std::optional<test_std::inplace_stop_token> token           = ::std::nullopt)
+        : m_shape(shape),
+          m_completion(&completion),
+          m_coverage(shape),
+          m_expectUnchunked(expectUnchunked),
+          m_token(token) {}
+
+    auto set_value() noexcept -> void override { m_completion->complete(completion_kind::value); }
+
+    auto set_error(::std::exception_ptr error) noexcept -> void override {
+        m_completion->complete(completion_kind::error, error);
+    }
+
+    auto set_stopped() noexcept -> void override { m_completion->complete(completion_kind::stopped); }
+
+    auto execute(::std::size_t begin, ::std::size_t end) noexcept -> void override {
+        const ::std::lock_guard guard(m_mutex);
+        ++m_executeCount;
+        if (begin >= end || end > m_shape || (m_expectUnchunked && end != begin + 1uz)) {
+            m_invalidRange = true;
+            return;
+        }
+        for (auto index = begin; index != end; ++index) {
+            ++m_coverage[index];
+        }
+    }
+
+    auto hasExactCoverage() const -> bool {
+        const ::std::lock_guard guard(m_mutex);
+        return !m_invalidRange &&
+               ::std::all_of(m_coverage.begin(), m_coverage.end(), [](unsigned count) { return count == 1u; });
+    }
+
+    auto executeCount() const -> ::std::size_t {
+        const ::std::lock_guard guard(m_mutex);
+        return m_executeCount;
+    }
+
+  private:
+    auto query_stop_token() const noexcept -> ::std::optional<test_std::inplace_stop_token> override {
+        return m_token;
+    }
+
+    const ::std::size_t                           m_shape;
+    completion_state*                             m_completion;
+    mutable ::std::mutex                          m_mutex;
+    ::std::vector<unsigned>                       m_coverage;
+    ::std::size_t                                 m_executeCount{};
+    bool                                          m_invalidRange{};
+    bool                                          m_expectUnchunked;
+    ::std::optional<test_std::inplace_stop_token> m_token;
+};
+
+struct backend_synopsis : replacement::parallel_scheduler_backend {
+    auto schedule(replacement::receiver_proxy&, ::std::span<::std::byte>) noexcept -> void override {}
     auto schedule_bulk_chunked(::std::size_t,
-                               replaceability::bulk_item_receiver_proxy&,
+                               replacement::bulk_item_receiver_proxy&,
                                ::std::span<::std::byte>) noexcept -> void override {}
     auto schedule_bulk_unchunked(::std::size_t,
-                                 replaceability::bulk_item_receiver_proxy&,
+                                 replacement::bulk_item_receiver_proxy&,
                                  ::std::span<::std::byte>) noexcept -> void override {}
 };
 
-struct thread_pool_base : replaceability::parallel_scheduler_backend {
-    struct task {
-        task() = default;
+struct stopped_receiver_env {
+    test_std::inplace_stop_token token;
 
-        task(const task&) = delete;
-
-        task(task&&) = delete;
-
-        virtual ~task() = default;
-
-        auto operator=(const task&) -> task& = delete;
-
-        auto operator=(task&&) -> task& = delete;
-
-        virtual auto exec() noexcept -> void = 0;
-    };
-
-    struct schedule_task : task {
-        explicit schedule_task(replaceability::receiver_proxy& p) noexcept : proxy(p) {}
-
-        auto exec() noexcept -> void override { proxy.set_value(); }
-
-        replaceability::receiver_proxy& proxy;
-    };
-
-    struct bulk_shared_state {
-        std::atomic<std::size_t> counter;
-        std::exception_ptr       exception;
-    };
-
-    struct bulk_task : task {
-        bulk_task(std::shared_ptr<bulk_shared_state>        counter,
-                  replaceability::bulk_item_receiver_proxy& proxy,
-                  std::size_t                               i,
-                  std::size_t                               j) noexcept
-            : shared_state(std::move(counter)), proxy(proxy), i(i), j(j) {}
-
-        auto exec() noexcept -> void override {
-            proxy.execute(i, j);
-            if (shared_state->counter.fetch_sub(1uz, std::memory_order_acq_rel) == 1uz) {
-                if (shared_state->exception) {
-                    proxy.set_error(shared_state->exception);
-                } else {
-                    proxy.set_value();
-                }
-            }
-        }
-
-        std::shared_ptr<bulk_shared_state>        shared_state;
-        replaceability::bulk_item_receiver_proxy& proxy;
-        std::size_t                               i;
-        std::size_t                               j;
-    };
-
-    thread_pool_base() = default;
-
-    thread_pool_base(const thread_pool_base&) = delete;
-
-    ~thread_pool_base() override = 0;
-
-    auto operator=(const thread_pool_base&) = delete;
-
-    auto shutdown() -> void {
-        std::unique_lock guard{mtx};
-        shutdown_requested = true;
-        guard.unlock();
-        cv.notify_all();
-    }
-
-    auto schedule(replaceability::receiver_proxy& proxy, ::std::span<::std::byte>) noexcept -> void override {
-        try {
-            auto             t = std::make_unique<schedule_task>(proxy);
-            std::unique_lock guard{mtx};
-            tasks.push(std::move(t));
-            guard.unlock();
-            cv.notify_one();
-        } catch (...) {
-            proxy.set_error(std::current_exception());
-        }
-    }
-
-    auto schedule_bulk(std::size_t                               shape,
-                       std::size_t                               chunk_length,
-                       replaceability::bulk_item_receiver_proxy& proxy,
-                       std::span<::std::byte>) noexcept -> void {
-        const std::size_t                  chunk_count = (shape + chunk_length - 1uz) / chunk_length;
-        std::shared_ptr<bulk_shared_state> shared_state;
-        try {
-            shared_state = std::make_shared<bulk_shared_state>(chunk_count);
-        } catch (...) {
-            proxy.set_error(std::current_exception());
-            return;
-        }
-        std::unique_lock guard{mtx};
-        for (std::size_t i = 0; i < chunk_count; ++i) {
-            try {
-                const std::size_t begin = i * chunk_length;
-                const std::size_t end   = std::min(begin + chunk_length, shape);
-                tasks.push(std::make_unique<bulk_task>(shared_state, proxy, begin, end));
-            } catch (...) {
-                const std::size_t n = chunk_count - i; // the count of `bulk_task` which are not enqueued successfully
-
-                guard.unlock();
-                if (i == 1uz) {
-                    cv.notify_one();
-                } else if (i > 1uz) {
-                    cv.notify_all();
-                }
-
-                // happens-before `proxy.set_value()/proxy.set_error(...)` in `bulk_task::exec`
-                shared_state->exception = std::current_exception();
-
-                if (shared_state->counter.fetch_sub(n, std::memory_order_acq_rel) == n) {
-                    proxy.set_error(shared_state->exception);
-                }
-                return;
-            }
-        }
-        guard.unlock();
-        cv.notify_all();
-    }
-
-    auto schedule_bulk_chunked(::std::size_t                             shape,
-                               replaceability::bulk_item_receiver_proxy& proxy,
-                               ::std::span<::std::byte>                  storage) noexcept -> void override {
-        const std::size_t chunk_length = (shape + num_threads - 1uz) / num_threads;
-        schedule_bulk(shape, chunk_length, proxy, storage);
-    }
-
-    auto schedule_bulk_unchunked(::std::size_t                             shape,
-                                 replaceability::bulk_item_receiver_proxy& proxy,
-                                 ::std::span<::std::byte>                  storage) noexcept -> void override {
-        schedule_bulk(shape, 1uz, proxy, storage);
-    }
-
-  protected:
-    static constexpr std::size_t      num_threads        = 4uz;
-    bool                              shutdown_requested = false;
-    std::mutex                        mtx;
-    std::condition_variable           cv;
-    std::queue<std::unique_ptr<task>> tasks;
+    auto query(const test_std::get_stop_token_t&) const noexcept -> test_std::inplace_stop_token { return token; }
 };
 
-thread_pool_base::~thread_pool_base() = default;
+struct stopped_receiver {
+    using receiver_concept = test_std::receiver_tag;
 
-struct thread_pool_backend : thread_pool_base {
-    thread_pool_backend() {
-        for (std::size_t i = 0; i < num_threads; ++i) {
-            workers[i] = std::thread([this]() noexcept { this->run(); });
-        }
+    ::std::shared_ptr<completion_state> completion;
+    test_std::inplace_stop_token        token;
+
+    auto set_value() && noexcept -> void { completion->complete(completion_kind::value); }
+
+    auto set_error(auto&&) && noexcept -> void { completion->complete(completion_kind::error); }
+
+    auto set_stopped() && noexcept -> void { completion->complete(completion_kind::stopped); }
+
+    auto get_env() const noexcept -> stopped_receiver_env { return {token}; }
+};
+
+struct blocking_proxy : replacement::receiver_proxy {
+    blocking_proxy(completion_state& completion, ::std::latch& started, ::std::latch& release) noexcept
+        : m_completion(&completion), m_started(&started), m_release(&release) {}
+
+    auto set_value() noexcept -> void override {
+        m_started->count_down();
+        m_release->wait();
+        m_completion->complete(completion_kind::value);
     }
 
-    ~thread_pool_backend() override {
-        shutdown();
-        for (auto& worker : workers) {
-            worker.join();
-        }
+    auto set_error(::std::exception_ptr error) noexcept -> void override {
+        m_completion->complete(completion_kind::error, error);
     }
+
+    auto set_stopped() noexcept -> void override { m_completion->complete(completion_kind::stopped); }
 
   private:
-    auto run() noexcept -> void {
-        while (true) {
-            std::unique_lock guard{mtx};
-            cv.wait(guard, [this]() noexcept { return !tasks.empty() || shutdown_requested; });
-            if (shutdown_requested && tasks.empty()) {
-                return;
-            }
-            auto task = std::move(tasks.front());
-            tasks.pop();
-            guard.unlock();
-            task->exec();
-        }
-    }
-
-    std::thread workers[num_threads];
+    completion_state* m_completion;
+    ::std::latch*     m_started;
+    ::std::latch*     m_release;
 };
 
-// for GCC and Clang, enable -fopenmp for both compiling and linking; for MSVC, use the /openmp:llvm compiler option.
-#ifdef _OPENMP
-struct openmp_backend : thread_pool_base {
-    openmp_backend() {
-        designee = std::thread{[this]() noexcept {
-#pragma omp parallel num_threads(num_threads)
-            {
-#pragma omp single
-                {
-                    while (true) {
-                        std::unique_lock guard{mtx};
-                        cv.wait(guard, [this]() noexcept { return !tasks.empty() || shutdown_requested; });
-                        if (shutdown_requested && tasks.empty()) {
-                            break;
-                        }
-                        auto front = std::move(tasks.front());
-                        tasks.pop();
-                        guard.unlock();
-                        auto front_ptr = front.release();
-#pragma omp task firstprivate(front_ptr)
-                        {
-                            std::unique_ptr<task>{front_ptr}->exec();
-                        }
-                    }
-                }
-            }
-        }};
-    }
-
-    ~openmp_backend() override {
-        shutdown();
-        designee.join();
-    }
-
-  private:
-    std::thread designee;
-};
-#endif
-
-auto test_parallel_scheduler_synopsis() -> void {
+auto testParallelSchedulerSynopsis() -> void {
     static_assert(!::std::default_initializable<test_std::parallel_scheduler>);
     static_assert(::std::copy_constructible<test_std::parallel_scheduler>);
     static_assert(::std::move_constructible<test_std::parallel_scheduler>);
     static_assert(test_std::scheduler<test_std::parallel_scheduler>);
-
     static_assert(::std::same_as<decltype(test_std::get_parallel_scheduler()), test_std::parallel_scheduler>);
     static_assert(::std::same_as<test_std::schedule_result_t<test_std::parallel_scheduler>,
                                  test_std::parallel_scheduler::sender>);
@@ -282,68 +225,272 @@ auto test_parallel_scheduler_synopsis() -> void {
                                  test_std::completion_signatures<test_std::set_value_t(),
                                                                  test_std::set_error_t(::std::exception_ptr),
                                                                  test_std::set_stopped_t()>>);
-
     static_assert(
         noexcept(test_std::get_forward_progress_guarantee(::std::declval<const test_std::parallel_scheduler&>())));
-    static_assert(::std::same_as<decltype(test_std::get_forward_progress_guarantee(
-                                     ::std::declval<const test_std::parallel_scheduler&>())),
-                                 test_std::forward_progress_guarantee>);
+    static_assert(::std::is_abstract_v<replacement::receiver_proxy>);
+    static_assert(::std::is_abstract_v<replacement::bulk_item_receiver_proxy>);
+    static_assert(::std::is_abstract_v<replacement::parallel_scheduler_backend>);
+    static_assert(::std::derived_from<backend_synopsis, replacement::parallel_scheduler_backend>);
+    static_assert(::std::same_as<decltype(replacement::query_parallel_scheduler_backend()),
+                                 ::std::shared_ptr<replacement::parallel_scheduler_backend>>);
 }
 
-auto test_replaceability_synopsis() -> void {
-    static_assert(::std::is_abstract_v<replaceability::receiver_proxy>);
-    static_assert(::std::is_abstract_v<replaceability::bulk_item_receiver_proxy>);
-    static_assert(::std::is_abstract_v<replaceability::parallel_scheduler_backend>);
-    static_assert(::std::derived_from<bulk_proxy, replaceability::receiver_proxy>);
-    static_assert(::std::derived_from<backend, replaceability::parallel_scheduler_backend>);
-    static_assert(::std::same_as<decltype(::std::declval<proxy&>().template try_query<int>(0)), ::std::optional<int>>);
-    static_assert(::std::same_as<decltype(replaceability::query_parallel_scheduler_backend()),
-                                 ::std::shared_ptr<replaceability::parallel_scheduler_backend>>);
-}
+auto testDefaultSchedulerAndOrdinarySchedule() -> void {
+    const auto first  = test_std::get_parallel_scheduler();
+    const auto second = test_std::get_parallel_scheduler();
+    ASSERT(first == second);
 
-auto test_parallel_scheduler_schedule() -> void {
-    auto sch = test_std::get_parallel_scheduler();
-    {
-        int i = 0;
-        test_std::sync_wait(test_std::schedule(sch) | test_std::then([&i]() noexcept { i = 114514; }));
-        ASSERT(i == 114514);
+    const auto caller = ::std::this_thread::get_id();
+    auto       worker = caller;
+    test_std::sync_wait(test_std::schedule(first) | test_std::then([&] { worker = ::std::this_thread::get_id(); }));
+    ASSERT(worker != caller);
+
+    ::std::atomic<unsigned> completions{};
+    for (unsigned index{}; index != 64u; ++index) {
+        test_std::sync_wait(test_std::schedule(first) | test_std::then([&] { ++completions; }));
     }
-    {
-        for (auto size : {1uz, 4uz, 8uz, 16uz, 32uz}) {
-            std::vector<int> vec(size);
-            std::iota(vec.begin(), vec.end(), 0);
+    ASSERT(completions.load() == 64u);
+}
 
-            test_std::sync_wait(
-                test_std::schedule(sch) |
-                test_std::bulk(test_std::par, vec.size(), [&vec](std::size_t i) noexcept { vec[i] = 2 * vec[i]; }));
-            for (std::size_t i = 0; i < vec.size(); ++i) {
-                ASSERT(vec[i] == 2 * static_cast<int>(i));
-            }
+auto testConcurrentSubmissions() -> void {
+    constexpr ::std::size_t THREAD_COUNT          = 8uz;
+    constexpr ::std::size_t OPERATIONS_PER_THREAD = 16uz;
 
-            test_std::sync_wait(
-                test_std::schedule(sch) |
-                test_std::bulk(test_std::seq, vec.size(), [&vec](std::size_t i) noexcept { ++vec[i]; }));
-            for (std::size_t i = 0; i < vec.size(); ++i) {
-                ASSERT(vec[i] == 2 * static_cast<int>(i) + 1);
+    const auto                   scheduler = test_std::get_parallel_scheduler();
+    ::std::barrier               start(static_cast<::std::ptrdiff_t>(THREAD_COUNT));
+    ::std::atomic<::std::size_t> completions{};
+    ::std::vector<::std::thread> submitters;
+    submitters.reserve(THREAD_COUNT);
+    for (::std::size_t threadIndex{}; threadIndex != THREAD_COUNT; ++threadIndex) {
+        submitters.emplace_back([&] {
+            start.arrive_and_wait();
+            for (::std::size_t index{}; index != OPERATIONS_PER_THREAD; ++index) {
+                test_std::sync_wait(test_std::schedule(scheduler) | test_std::then([&] { ++completions; }));
             }
+        });
+    }
+    for (auto& submitter : submitters) {
+        submitter.join();
+    }
+    ASSERT(completions.load() == THREAD_COUNT * OPERATIONS_PER_THREAD);
+}
+
+auto testFrontendBulk() -> void {
+    const auto scheduler = test_std::get_parallel_scheduler();
+    for (const auto shape : {0uz, 1uz, 3uz, 257uz}) {
+        ::std::vector<unsigned> coverage(shape);
+        ::std::mutex            mutex;
+        test_std::sync_wait(test_std::schedule(scheduler) |
+                            test_std::bulk(test_std::par, shape, [&](::std::size_t index) noexcept {
+                                const ::std::lock_guard guard(mutex);
+                                ++coverage[index];
+                            }));
+        ASSERT(::std::all_of(coverage.begin(), coverage.end(), [](unsigned count) { return count == 1u; }));
+
+        ::std::fill(coverage.begin(), coverage.end(), 0u);
+        test_std::sync_wait(
+            test_std::schedule(scheduler) |
+            test_std::bulk_chunked(test_std::par, shape, [&](::std::size_t begin, ::std::size_t end) noexcept {
+                const ::std::lock_guard guard(mutex);
+                for (auto index = begin; index != end; ++index) {
+                    ++coverage[index];
+                }
+            }));
+        ASSERT(::std::all_of(coverage.begin(), coverage.end(), [](unsigned count) { return count == 1u; }));
+
+        ::std::fill(coverage.begin(), coverage.end(), 0u);
+        test_std::sync_wait(test_std::schedule(scheduler) |
+                            test_std::bulk_unchunked(test_std::par, shape, [&](::std::size_t index) noexcept {
+                                const ::std::lock_guard guard(mutex);
+                                ++coverage[index];
+                            }));
+        ASSERT(::std::all_of(coverage.begin(), coverage.end(), [](unsigned count) { return count == 1u; }));
+    }
+
+    ::std::vector<unsigned> sequential(17uz);
+    test_std::sync_wait(
+        test_std::schedule(scheduler) |
+        test_std::bulk(test_std::seq, sequential.size(), [&](::std::size_t index) noexcept { ++sequential[index]; }));
+    ASSERT(::std::all_of(sequential.begin(), sequential.end(), [](unsigned count) { return count == 1u; }));
+}
+
+auto testBackendBulkRanges() -> void {
+    auto backend = replacement::query_parallel_scheduler_backend();
+    for (const auto shape : {0uz, 1uz, 3uz, 257uz}) {
+        {
+            completion_state                       completion;
+            bulk_proxy                             receiver(shape, completion);
+            alignas(::std::max_align_t)::std::byte storage[512uz];
+            backend->schedule_bulk_chunked(shape, receiver, storage);
+            completion.wait();
+            ASSERT(completion.count() == 1uz);
+            ASSERT(completion.kind() == completion_kind::value);
+            ASSERT(receiver.hasExactCoverage());
+            ASSERT(receiver.executeCount() != 0uz || shape == 0uz);
+        }
+        {
+            completion_state                       completion;
+            bulk_proxy                             receiver(shape, completion, true);
+            alignas(::std::max_align_t)::std::byte storage[512uz];
+            backend->schedule_bulk_unchunked(shape, receiver, storage);
+            completion.wait();
+            ASSERT(completion.count() == 1uz);
+            ASSERT(completion.kind() == completion_kind::value);
+            ASSERT(receiver.hasExactCoverage());
+            ASSERT(receiver.executeCount() == shape);
         }
     }
 }
+
+auto testStopsBeforeStart() -> void {
+    test_std::inplace_stop_source source;
+    ASSERT(source.request_stop());
+
+    auto completion = ::std::make_shared<completion_state>();
+    auto operation  = test_std::connect(test_std::schedule(test_std::get_parallel_scheduler()),
+                                       stopped_receiver{completion, source.get_token()});
+    test_std::start(operation);
+    completion->wait();
+    ASSERT(completion->count() == 1uz);
+    ASSERT(completion->kind() == completion_kind::stopped);
+}
+
+auto testStopWhileQueued() -> void {
+    auto backend = test_detail::makePortableParallelSchedulerBackendForTesting(1uz);
+
+    completion_state                       blockerCompletion;
+    ::std::latch                           blockerStarted(1);
+    ::std::latch                           blockerRelease(1);
+    blocking_proxy                         blocker(blockerCompletion, blockerStarted, blockerRelease);
+    alignas(::std::max_align_t)::std::byte blockerStorage[512uz];
+    backend->schedule(blocker, blockerStorage);
+    blockerStarted.wait();
+
+    test_std::inplace_stop_source          source;
+    completion_state                       stoppedCompletion;
+    proxy                                  stopped(stoppedCompletion, source.get_token());
+    alignas(::std::max_align_t)::std::byte stoppedStorage[512uz];
+    backend->schedule(stopped, stoppedStorage);
+    ASSERT(source.request_stop());
+
+    blockerRelease.count_down();
+    blockerCompletion.wait();
+    stoppedCompletion.wait();
+    ASSERT(blockerCompletion.kind() == completion_kind::value);
+    ASSERT(stoppedCompletion.count() == 1uz);
+    ASSERT(stoppedCompletion.kind() == completion_kind::stopped);
+}
+
+auto testScratchStorageAndFailures() -> void {
+    auto backend = test_detail::makePortableParallelSchedulerBackendForTesting(1uz);
+
+    test_detail::resetParallelSchedulerAllocationCountsForTesting();
+    {
+        completion_state                       completion;
+        proxy                                  receiver(completion);
+        alignas(::std::max_align_t)::std::byte storage[512uz];
+        backend->schedule(receiver, storage);
+        completion.wait();
+        ASSERT(completion.kind() == completion_kind::value);
+        ASSERT(completion.count() == 1uz);
+    }
+    ASSERT(test_detail::parallelSchedulerInPlaceAllocationsForTesting() == 1uz);
+    ASSERT(test_detail::parallelSchedulerHeapAllocationsForTesting() == 0uz);
+
+    test_detail::resetParallelSchedulerAllocationCountsForTesting();
+    {
+        completion_state completion;
+        proxy            receiver(completion);
+        backend->schedule(receiver, {});
+        completion.wait();
+        ASSERT(completion.kind() == completion_kind::value);
+        ASSERT(completion.count() == 1uz);
+    }
+    ASSERT(test_detail::parallelSchedulerInPlaceAllocationsForTesting() == 0uz);
+    ASSERT(test_detail::parallelSchedulerHeapAllocationsForTesting() == 1uz);
+
+    {
+        test_detail::failNextParallelSchedulerAllocationForTesting();
+        completion_state                       completion;
+        proxy                                  receiver(completion);
+        alignas(::std::max_align_t)::std::byte storage[512uz];
+        backend->schedule(receiver, storage);
+        completion.wait();
+        ASSERT(completion.kind() == completion_kind::error);
+        ASSERT(completion.hasError());
+        ASSERT(completion.count() == 1uz);
+    }
+    {
+        test_detail::failNextParallelSchedulerEnqueueForTesting();
+        completion_state                       completion;
+        proxy                                  receiver(completion);
+        alignas(::std::max_align_t)::std::byte storage[512uz];
+        backend->schedule(receiver, storage);
+        completion.wait();
+        ASSERT(completion.kind() == completion_kind::error);
+        ASSERT(completion.hasError());
+        ASSERT(completion.count() == 1uz);
+    }
+    {
+        test_detail::failNextParallelSchedulerEnqueueForTesting();
+        completion_state                       completion;
+        bulk_proxy                             receiver(8uz, completion);
+        alignas(::std::max_align_t)::std::byte storage[512uz];
+        backend->schedule_bulk_chunked(8uz, receiver, storage);
+        completion.wait();
+        ASSERT(completion.kind() == completion_kind::error);
+        ASSERT(completion.hasError());
+        ASSERT(completion.count() == 1uz);
+        ASSERT(receiver.executeCount() == 0uz);
+    }
+}
+
+auto testBackendDestructionDrainsAndJoins() -> void {
+    auto backend = test_detail::makePortableParallelSchedulerBackendForTesting(1uz);
+
+    completion_state                       blockerCompletion;
+    ::std::latch                           blockerStarted(1);
+    ::std::latch                           blockerRelease(1);
+    blocking_proxy                         blocker(blockerCompletion, blockerStarted, blockerRelease);
+    alignas(::std::max_align_t)::std::byte blockerStorage[512uz];
+    backend->schedule(blocker, blockerStorage);
+    blockerStarted.wait();
+
+    completion_state                       queuedCompletion;
+    proxy                                  queued(queuedCompletion);
+    alignas(::std::max_align_t)::std::byte queuedStorage[512uz];
+    backend->schedule(queued, queuedStorage);
+
+    ::std::latch  destructionStarted(1);
+    ::std::latch  destructionFinished(1);
+    ::std::thread destroyer(
+        [ownedBackend = ::std::move(backend), &destructionStarted, &destructionFinished]() mutable {
+            destructionStarted.count_down();
+            ownedBackend.reset();
+            destructionFinished.count_down();
+        });
+    destructionStarted.wait();
+    blockerRelease.count_down();
+    blockerCompletion.wait();
+    queuedCompletion.wait();
+    destructionFinished.wait();
+    destroyer.join();
+
+    ASSERT(blockerCompletion.kind() == completion_kind::value);
+    ASSERT(queuedCompletion.kind() == completion_kind::value);
+    ASSERT(blockerCompletion.count() == 1uz);
+    ASSERT(queuedCompletion.count() == 1uz);
+}
 } // namespace
 
-namespace beman::execution::parallel_scheduler_replacement {
-auto query_parallel_scheduler_backend() -> std::shared_ptr<parallel_scheduler_backend> {
-#ifdef _OPENMP
-    static auto backend = std::make_shared<::openmp_backend>();
-#else
-    static auto backend = std::make_shared<::thread_pool_backend>();
-#endif
-    return backend;
-}
-} // namespace beman::execution::parallel_scheduler_replacement
-
 TEST(exec_parallel_scheduler) {
-    test_parallel_scheduler_synopsis();
-    test_replaceability_synopsis();
-    test_parallel_scheduler_schedule();
+    testParallelSchedulerSynopsis();
+    testDefaultSchedulerAndOrdinarySchedule();
+    testConcurrentSubmissions();
+    testFrontendBulk();
+    testBackendBulkRanges();
+    testStopsBeforeStart();
+    testStopWhileQueued();
+    testScratchStorageAndFailures();
+    testBackendDestructionDrainsAndJoins();
 }

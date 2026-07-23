@@ -38,6 +38,7 @@ list(
     exec-let.test
     exec-on.test
     exec-parallel-scheduler.test
+    exec-parallel-scheduler-replacement.test
     exec-opstate-start.test
     exec-opstate.test
     exec-prop.test

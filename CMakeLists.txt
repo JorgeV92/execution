@@ -17,6 +17,8 @@ include(./cmake/cxx-modules-rules.cmake)
 set(BEMAN_EXECUTION_TARGET_NAME beman.execution_headers) # used in src, and docs
 set(BEMAN_EXECUTION_TARGET_PREFIX ${PROJECT_NAME}) # NOTE: used in src, and docs?
 
+find_package(Threads REQUIRED)
+
 #===============================================================================
 if(BEMAN_USE_MODULES)
     option(BUILD_SHARED_LIBS "Build using shared libraries" OFF)
@@ -69,7 +71,6 @@ if(BEMAN_USE_MODULES)
         )
     endif()
 
-    find_package(Threads REQUIRED)
     target_link_libraries(
         ${BEMAN_EXECUTION_TARGET_PREFIX}
         PUBLIC Threads::Threads
@@ -107,12 +108,36 @@ option(
 add_subdirectory(src/beman/execution)
 
 if(NOT BEMAN_USE_MODULES)
-    add_library(beman.execution INTERFACE)
+    add_library(
+        beman.execution
+        STATIC src/beman/execution/parallel_scheduler_default.cpp
+    )
+    target_compile_features(
+        beman.execution
+        PUBLIC cxx_std_${CMAKE_CXX_STANDARD}
+    )
+    target_include_directories(
+        beman.execution
+        PUBLIC
+            "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
+            "$<INSTALL_INTERFACE:include>"
+    )
     target_link_libraries(
         beman.execution
-        INTERFACE ${BEMAN_EXECUTION_TARGET_NAME}
+        PUBLIC Threads::Threads
+    )
+    target_link_libraries(
+        ${BEMAN_EXECUTION_TARGET_NAME}
+        INTERFACE beman.execution
     )
     add_library(beman::execution ALIAS beman.execution)
+endif()
+
+if(BEMAN_EXECUTION_BUILD_TESTS)
+    target_compile_definitions(
+        ${BEMAN_EXECUTION_TARGET_PREFIX}
+        PRIVATE BEMAN_EXECUTION_TESTING
+    )
 endif()
 
 #===============================================================================
